@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Air-Gapped QR Transfer</title>
+  
+  <!-- Standalone Cross-Platform Libraries -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #0f172a; color: #f8fafc;
+      display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 15px;
+    }
+    .container { width: 100%; max-width: 480px; }
+    .tabs { display: flex; background: #1e293b; border-radius: 12px; padding: 4px; margin-bottom: 15px; }
+    .tab-btn {
+      flex: 1; padding: 12px; font-size: 16px; font-weight: 600; border: none;
+      background: transparent; color: #94a3b8; border-radius: 8px; cursor: pointer;
+    }
+    .tab-btn.active { background: #3b82f6; color: #ffffff; }
+    .panel { display: none; background: #1e293b; border-radius: 12px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+    .panel.active { display: block; }
+    
+    input[type="file"], select, button {
+      width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #334155;
+      background: #0f172a; color: #fff; font-size: 14px; margin-bottom: 12px; outline: none;
+    }
+    button.primary { background: #3b82f6; border: none; font-weight: bold; cursor: pointer; }
+    button.primary:active { background: #2563eb; }
+    button.danger { background: #ef4444; border: none; font-weight: bold; }
+    
+    #qrcode {
+      display: flex; justify-content: center; align-items: center;
+      background: white; padding: 15px; border-radius: 12px; margin-top: 15px; min-height: 250px;
+    }
+    #qrcode img, #qrcode canvas { width: 100% !important; height: auto !important; max-width: 280px; }
+
+    #video-wrapper { position: relative; width: 100%; border-radius: 12px; overflow: hidden; background: #000; display: none; margin-top: 10px; }
+    video { width: 100%; height: auto; display: block; }
+    
+    .progress-bar { width: 100%; background: #334155; height: 16px; border-radius: 8px; overflow: hidden; margin: 12px 0; }
+    .progress-fill { height: 100%; background: #10b981; width: 0%; transition: width 0.1s ease; }
+    .status-box { font-size: 14px; font-weight: 600; text-align: center; color: #38bdf8; word-break: break-all; }
+    
+    .download-link {
+      display: block; width: 100%; text-align: center; padding: 14px;
+      background: #10b981; color: white; text-decoration: none; font-weight: bold;
+      border-radius: 8px; margin-top: 15px;
+    }
+    .warning-box {
+      background: #451a03; border: 1px solid #78350f; color: #fde047;
+      padding: 10px; border-radius: 8px; font-size: 12px; margin-bottom: 12px; display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <div id="httpsWarning" class="warning-box">
+      ⚠️ <b>Camera Block Warning:</b> Mobile browsers disable cameras unless hosted over <b>HTTPS</b> or <b>localhost</b>.
+    </div>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('send')">Sender</button>
+      <button class="tab-btn" onclick="switchTab('receive')">Receiver</button>
+    </div>
+
+    <!-- SENDER TAB -->
+    <div id="sendPanel" class="panel active">
+      <input type="file" id="fileInput" />
+      
+      <label style="font-size: 12px; color: #94a3b8;">Chunk Size (Bytes): <b id="chunkVal">150</b></label>
+      <input type="range" id="chunkSize" min="80" max="300" value="150" oninput="document.getElementById('chunkVal').innerText=this.value" style="width:100%; margin-bottom:12px;">
+
+      <label style="font-size: 12px; color: #94a3b8;">Speed (FPS): <b id="fpsVal">7</b></label>
+      <input type="range" id="fps" min="2" max="15" value="7" oninput="document.getElementById('fpsVal').innerText=this.value" style="width:100%; margin-bottom:12px;">
+
+      <button class="primary" onclick="startTransmitting()">Start Transmitting</button>
+      <button class="danger" onclick="stopTransmitting()">Stop</button>
+
+      <div id="sendStats" class="status-box" style="margin-top:10px;"></div>
+      <div id="qrcode"></div>
+    </div>
+
+    <!-- RECEIVER TAB -->
+    <div id="receivePanel" class="panel">
+      <select id="cameraSelect" style="display:none;"></select>
+      <button class="primary" onclick="startScanner()">Start Camera Scanner</button>
+      <button class="danger" onclick="stopScanner()">Stop Camera</button>
+
+      <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+      <div id="receiveStats" class="status-box">Status: Ready</div>
+
+      <div id="video-wrapper">
+        <video id="video" playsinline muted></video>
+      </div>
+      <canvas id="canvas" style="display:none;"></canvas>
+      
+      <div id="downloadArea"></div>
+    </div>
+  </div>
+
+  <script>
+    // Security check for mobile cameras
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      document.getElementById('httpsWarning').style.display = 'block';
+    }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      if(tab === 'send') {
+        document.querySelectorAll('.tab-btn')[0].classList.add('active');
+        document.getElementById('sendPanel').classList.add('active');
+      } else {
+        document.querySelectorAll('.tab-btn')[1].classList.add('active');
+        document.getElementById('receivePanel').classList.add('active');
+      }
+    }
+
+    // --- MOBILE SAFE CHUNK & BASE64 CONVERTERS ---
+    function uint8ToBase64(bytes) {
+      let binary = '';
+      const len = bytes.byteLength;
+      for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return window.btoa(binary);
+    }
+
+    function base64ToUint8(base64) {
+      const binary = window.atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    // --- SENDER ENGINE ---
+    let sendTimer = null;
+    let qrObj = null;
+
+    async function startTransmitting() {
+      stopTransmitting();
+      const fileInput = document.getElementById('fileInput');
+      if (!fileInput.files.length) return alert('Select a file to transfer.');
+
+      const file = fileInput.files[0];
+      const chunkSize = parseInt(document.getElementById('chunkSize').value);
+      const fps = parseInt(document.getElementById('fps').value);
+
+      document.getElementById('sendStats').innerText = "Compressing file...";
+
+      // Async reading to keep main UI thread fast
+      const arrayBuffer = await file.arrayBuffer();
+      const compressed = pako.deflate(new Uint8Array(arrayBuffer));
+      const base64Str = uint8ToBase64(compressed);
+
+      const totalChunks = Math.ceil(base64Str.length / chunkSize);
+      const fileId = Math.random().toString(36).substring(2, 6);
+
+      const chunks = [];
+      for (let i = 0; i < totalChunks; i++) {
+        chunks.push(JSON.stringify({
+          id: fileId,
+          fn: file.name,
+          i: i,
+          t: totalChunks,
+          d: base64Str.slice(i * chunkSize, (i + 1) * chunkSize)
+        }));
+      }
+
+      const qrBox = document.getElementById('qrcode');
+      qrBox.innerHTML = "";
+      qrObj = new QRCode(qrBox, {
+        width: 260, height: 260,
+        correctLevel: QRCode.CorrectLevel.L
+      });
+
+      let idx = 0;
+      sendTimer = setInterval(() => {
+        qrObj.clear();
+        qrObj.makeCode(chunks[idx]);
+        document.getElementById('sendStats').innerText = `Sending Chunk: ${idx + 1} / ${totalChunks}`;
+        idx = (idx + 1) % totalChunks;
+      }, 1000 / fps);
+    }
+
+    function stopTransmitting() {
+      if (sendTimer) clearInterval(sendTimer);
+      document.getElementById('sendStats').innerText = "";
+    }
+
+    // --- RECEIVER SCANNER ENGINE (CROSS-PLATFORM CAMERA FIX) ---
+    let video = document.getElementById('video');
+    let canvas = document.getElementById('canvas');
+    let ctx = canvas.getContext('2d');
+    let stream = null;
+    let animId = null;
+
+    let receivedData = {};
+    let expectedTotal = null;
+    let fileMeta = null;
+
+    async function startScanner() {
+      stopScanner();
+      receivedData = {};
+      expectedTotal = null;
+      fileMeta = null;
+      document.getElementById('downloadArea').innerHTML = "";
+      document.getElementById('progressFill').style.width = "0%";
+
+      // Cross-platform Camera Initialization Strategy
+      const constraintsList = [
+        { video: { facingMode: { exact: "environment" } } }, // Universal Android/iOS Back Camera
+        { video: { facingMode: "environment" } },            // Fallback Back Camera
+        { video: true }                                     // Desktop/Default Camera
+      ];
+
+      for (let constraint of constraintsList) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraint);
+          if (stream) break;
+        } catch (e) { /* keep trying fallback constraints */ }
+      }
+
+      if (!stream) return alert("Could not access camera. Make sure you granted permissions and are using HTTPS or Localhost.");
+
+      video.srcObject = stream;
+      video.setAttribute("playsinline", true); // CRITICAL FIX FOR iOS SAFARI
+      document.getElementById('video-wrapper').style.display = 'block';
+      await video.play();
+
+      requestAnimationFrame(scanFrame);
+    }
+
+    function scanFrame() {
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        // jsQR decoder
+        const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "dontInvert" });
+
+        if (code && code.data) {
+          processFrame(code.data);
+        }
+      }
+
+      if (stream) {
+        animId = requestAnimationFrame(scanFrame);
+      }
+    }
+
+    function processFrame(payloadStr) {
+      try {
+        const pkg = JSON.parse(payloadStr);
+        if (!pkg.id || pkg.i === undefined || !pkg.t || !pkg.d) return;
+
+        if (!expectedTotal) {
+          expectedTotal = pkg.t;
+          fileMeta = { name: pkg.fn, id: pkg.id };
+        }
+
+        if (pkg.id === fileMeta.id && !(pkg.i in receivedData)) {
+          receivedData[pkg.i] = pkg.d;
+
+          const collected = Object.keys(receivedData).length;
+          const pct = Math.round((collected / expectedTotal) * 100);
+
+          document.getElementById('progressFill').style.width = pct + "%";
+          document.getElementById('receiveStats').innerText = `Collected ${collected} / ${expectedTotal} (${pct}%)`;
+
+          if (collected === expectedTotal) {
+            stopScanner();
+            compileAndSave();
+          }
+        }
+      } catch (e) { /* Ignore non-protocol scans */ }
+    }
+
+    function stopScanner() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      if (animId) cancelAnimationFrame(animId);
+      document.getElementById('video-wrapper').style.display = 'none';
+      document.getElementById('receiveStats').innerText = "Status: Idle";
+    }
+
+    function compileAndSave() {
+      document.getElementById('receiveStats').innerText = "Reconstructing File...";
+      setTimeout(() => {
+        try {
+          let b64 = "";
+          for (let i = 0; i < expectedTotal; i++) {
+            b64 += receivedData[i];
+          }
+
+          const compressed = base64ToUint8(b64);
+          const originalBytes = pako.inflate(compressed);
+
+          const blob = new Blob([originalBytes]);
+          const url = URL.createObjectURL(blob);
+
+          const a = document.createElement('a');
+          a.className = "download-link";
+          a.href = url;
+          a.download = fileMeta.name;
+          a.innerText = `Save File (${fileMeta.name})`;
+
+          document.getElementById('downloadArea').appendChild(a);
+          document.getElementById('receiveStats').innerText = "Transfer Complete!";
+        } catch (err) {
+          document.getElementById('receiveStats').innerText = "Reassembly Error: " + err.message;
+        }
+      }, 50);
+    }
+  </script>
+</body>
+</html>
